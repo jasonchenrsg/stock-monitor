@@ -1,0 +1,52 @@
+name: Intraday Stock Monitor
+
+on:
+  schedule:
+    - cron: '*/15 13-23 * * 1-5' # Every 15 min, 9:00 AM–7:00 PM UTC (1:00 PM–11:00 PM UTC), Mon–Fri
+  workflow_dispatch:
+
+jobs:
+  intraday-poll:
+    runs-on: ubuntu-latest
+    env:
+      PYTZ_TIMEZONE: America/New_York
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      SMTP_SERVER: smtp.gmail.com
+      SMTP_PORT: 465
+      ALERT_TO: ${{ secrets.ALERT_TO }}
+      ALERT_TRIGGERS: SMA20_GAP,BOLLINGER,RSI,VIX25,DD10
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run intraday poll
+      run: python market_dip_monitor_v2.py intraday
+
+    - name: Commit and push logs
+      run: |
+        git config --global user.name 'GitHub Actions'
+        git config --global user.email 'actions@github.com'
+        git add logs/
+        git commit -m "Update logs from intraday poll" || echo "No changes to commit"
+        git push
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload logs as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: intraday-logs
+        path: logs/
+        retention-days: 7
