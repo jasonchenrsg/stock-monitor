@@ -22,9 +22,6 @@ $ python market_dip_monitor.py daily_summary
 Historical summary for a given date (YYYY-MM-DD)
 $ python market_dip_monitor.py daily_summary 2025-04-10
 
-
-
-
 Dependencies: pandas, yfinance, pytz (all pure-Python).
 """
 import os
@@ -87,7 +84,13 @@ def fetch_prices(start: date, end: date, interval: str = "1d", retries: int = 3)
     cache_file = LOG_DIR / f"prices_{start}_{end}_{interval}.csv"
     if cache_file.exists():
         try:
-            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            prices = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            # Validate cache
+            if prices.empty or all(prices[t].isna().all() for t in TICKERS + [VIX_TICKER] if t in prices.columns):
+                print(f"Invalid cache {cache_file}, refetching")
+            else:
+                print(f"Loaded cached data from {cache_file}")
+                return prices
         except Exception as e:
             print(f"Error reading cache {cache_file}: {e}")
 
@@ -110,6 +113,7 @@ def fetch_prices(start: date, end: date, interval: str = "1d", retries: int = 3)
             # Cache data
             try:
                 prices.to_csv(cache_file)
+                print(f"Saved data to {cache_file}")
             except Exception as e:
                 print(f"Error caching data to {cache_file}: {e}")
             return prices
@@ -158,8 +162,14 @@ def compute_indicators(df_daily: pd.DataFrame) -> dict:
             "rsi"       : rsi,
             "drawdown"  : (high52 - series.iloc[-1]) / high52 if not pd.isna(high52) else 0,
         }
+        # Debug logging
+        print(f"{t} Indicators: Close={ind[t]['latest']:.2f}, SMA20={sma20:.2f}, "
+              f"SMA20_GAP={((ind[t]['latest'] - sma20) / sma20 * 100):.2f}%, "
+              f"Lower_BB={ind[t]['lower_band']:.2f}, RSI={rsi:.2f}, "
+              f"Drawdown={ind[t]['drawdown']*100:.2f}%")
     if VIX_TICKER in df_daily.columns and not df_daily[VIX_TICKER].isna().all():
         ind["VIX"] = df_daily[VIX_TICKER].iloc[-1]
+        print(f"VIX: {ind['VIX']:.2f}")
     else:
         print(f"Warning: No valid VIX data, setting VIX to 0")
         ind["VIX"] = 0
@@ -189,15 +199,16 @@ def evaluate_events(ind: dict) -> List[Tuple[str, str, float]]:
         # Drawdown
         if not pd.isna(i["drawdown"]) and i["drawdown"] >= DRAW_PCT:
             out.append(("DD10", t, price))
-    # Fear gauges
-    if vix_val > VIX_WARN:
-        for t in TICKERS:
-            if t in ind:
-                out.append(("VIX25", t, ind[t]["latest"]))
-    if vix_val > VIX_BRAKE:
-        for t in TICKERS:
-            if t in ind:
-                out.append(("RISK_BRAKE", t, ind[t]["latest"]))
+        # Fear gauges
+        if vix_val > VIX_WARN:
+            out.append(("VIX25", t, price))
+        if vix_val > VIX_BRAKE:
+            out.append(("RISK_BRAKE", t, price))
+    # Debug events
+    if out:
+        print(f"Events triggered: {[(ev, tk, price) for ev, tk, price in out]}")
+    else:
+        print("No events triggered")
     return out
 
 # Logging -------------------------------------------------------
@@ -214,35 +225,29 @@ def log_events(events: List[Tuple[str, str, float]], as_of: date) -> None:
         for ev, ticker, price in events:
             w.writerow([now().isoformat(), ev, ticker, f"{price:.2f}"])
 
-def log_daily_event_summary(as_of: date) -> None:
-    """Append daily event counts to a summary CSV file."""
+def update_summary(events: List[Tuple[str, str, float]], as_of: date) -> None:
+    """Update daily event counts in a summary CSV file, ensuring one row per day."""
     counts = {ev: 0 for ev in EVENTS}
-    log_file = LOG_DIR / f"{as_of}_events.csv"
-    if log_file.exists():
-        try:
-            with log_file.open(encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row["event"] in counts:
-                        counts[row["event"]] += 1
-        except Exception as e:
-            print(f"Error reading log {log_file}: {e}")
-
+    for ev, _, _ in events:
+        if ev in counts:
+            counts[ev] += 1
     summary_file = LOG_DIR / "event_summary.csv"
-    new_file = not summary_file.exists()
-    with summary_file.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(["date"] + list(EVENTS.keys()))
-        w.writerow([as_of.isoformat()] + [counts[ev] for ev in EVENTS])
+    try:
+        summary = pd.read_csv(summary_file) if summary_file.exists() else pd.DataFrame(columns=["date"] + list(EVENTS.keys()))
+        # Remove existing entry for as_of
+        summary = summary[summary["date"] != as_of.isoformat()]
+        # Append new counts
+        new_row = pd.DataFrame([{"date": as_of.isoformat(), **counts}])
+        summary = pd.concat([summary, new_row], ignore_index=True)
+        summary.to_csv(summary_file, index=False)
+        print(f"Updated summary for {as_of}: {counts}")
+    except Exception as e:
+        print(f"Error updating summary: {e}")
 
 # Email ---------------------------------------------------------
 
 def send_email(events: List[Tuple[str, str, float]]) -> None:
-    """Send email alerts for triggered events if configured.
-
-    Args:
-        events: List of (event, ticker, price) tuples.
-    """
+    """Send email alerts for triggered events if configured."""
     if not (SMTP_USER and SMTP_PASS and ALERT_TO):
         print("Email not configured, skipping")
         return
@@ -279,7 +284,7 @@ def intraday_poll() -> None:
     ind = compute_indicators(df)
     events = evaluate_events(ind)
     log_events(events, as_of=end_date)
-    log_daily_event_summary(as_of=end_date)
+    update_summary(events, as_of=end_date)
     send_email(events)
     for ev, tk, price in events:
         print(f"{ev} on {tk} at {price:.2f}")
@@ -303,8 +308,7 @@ def historical_poll(start_date: date, end_date: date) -> None:
         ind = compute_indicators(df)
         events = evaluate_events(ind)
         log_events(events, as_of=current_date)
-        log_daily_event_summary(as_of=current_date)
-        # send_email(events)  # Skip emailing for historical runs
+        update_summary(events, as_of=current_date)
         for ev, tk, price in events:
             print(f"{current_date}: {ev} on {tk} at {price:.2f}")
         current_date += timedelta(days=1)
@@ -318,7 +322,7 @@ def daily_summary(target: date) -> None:
         print(f"No daily data available for {target}")
         return
     if df_d.index[-1].date() != target:
-        print(f"Warning: Latest data is from {df.index[-1].date()}, expected {target}")
+        print(f"Warning: Latest data is from {df_d.index[-1].date()}, expected {target}")
     ind = compute_indicators(df_d)
     events = evaluate_events(ind)
     log_events(events, as_of=target)
