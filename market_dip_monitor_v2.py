@@ -1,391 +1,257 @@
-#!/usr/bin/env python3
-"""
-market_dip_monitor.py — Monitor VOO & QQQM for dip-buy signals
-=============================================================
-
-*Checks every 15 min (or on demand) whether a set of 'buy-the-dip' criteria
-fire, logs each trigger, and optionally sends an email alert.*
-
-Designed for GitHub Actions **and** easy local testing.
-
-Quick CLI
----------
-15-min intraday poll (uses 15-minute bars)
-$ python market_dip_monitor.py intraday
-
-Historical poll for a date range (YYYY-MM-DD YYYY-MM-DD)
-$ python market_dip_monitor.py historical 2025-04-01 2025-04-24
-
-End-of-day summary for today
-$ python market_dip_monitor.py daily_summary
-
-Historical summary for a given date (YYYY-MM-DD)
-$ python market_dip_monitor.py daily_summary 2025-04-10
-
-Dependencies: pandas, yfinance, pytz (all pure-Python).
-"""
-import os
-import sys
-import csv
-import time
-from pathlib import Path
-from datetime import datetime, date, timedelta
-from typing import List, Tuple
-import pytz
-import pandas as pd
 import yfinance as yf
-import smtplib
-from ssl import create_default_context
-from email.message import EmailMessage
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime, timedelta
+import time
+import logging
+from pathlib import Path
 
-# ─────────────── configuration ────────────────
-TZ          = pytz.timezone(os.getenv("PYTZ_TIMEZONE", "America/New_York"))
-TICKERS     = ["VOO", "QQQM"]
-VIX_TICKER  = "^VIX"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/market_dip_monitor_v2.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-EVENTS = {
-    "SMA20_GAP" : "Price ≤ SMA20 −0.75%",
-    "BOLLINGER" : "Touched lower Bollinger band (20-period, 1σ)",
-    "RSI"       : "RSI < 30 (20-period)",
-    "VIX25"     : "VIX > 25",
-    "DD10"      : "Price ≥10% below 52-wk high",
-    "RISK_BRAKE": "VIX > 35 risk brake (skip buys)"
-}
-# thresholds
-GAP_PCT   = 0.0075   # 0.75 %
-VIX_WARN  = 25
-VIX_BRAKE = 35
-DRAW_PCT  = 0.10     # 10 % drawdown
+# Constants
+TICKERS = ['VOO', 'QQQM', '^VIX']
+POLL_INTERVAL = 15 * 60  # 15 minutes in seconds
+TRADING_HOURS_START = pd.to_datetime('09:30:00').time()
+TRADING_HOURS_END = pd.to_datetime('16:00:00').time()
+PRICE_HISTORY_DAYS = 20  # For SMA20 and other indicators
+DATA_DIR = 'logs'
+EVENTS_FILE = f'{DATA_DIR}/2025-04-30_events.csv'
+SUMMARY_FILE = f'{DATA_DIR}/event_summary.csv'
+PRICES_FILE = f'{DATA_DIR}/prices_2025-04-30_15m.csv'
 
-# email (all optional)
-SMTP_USER      = os.getenv("SMTP_USER")
-SMTP_PASS      = os.getenv("SMTP_PASS")
-SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT      = int(os.getenv("SMTP_PORT", 465))
-ALERT_TO       = os.getenv("ALERT_TO")
-ALERT_TRIGGERS = set(os.getenv("ALERT_TRIGGERS", "SMA20_GAP,BOLLINGER,RSI,VIX25,DD10").split(','))
+# Ensure data directory exists
+Path(DATA_DIR).mkdir(exist_ok=True)
 
-LOG_DIR = Path("logs"); LOG_DIR.mkdir(exist_ok=True)
-
-# ─────────────── util helpers ────────────────
-
-def now() -> datetime:
-    return datetime.now(TZ)
-
-# Fetch wrapper -------------------------------------------------
-
-def fetch_prices(start: date, end: date, interval: str = "1d", retries: int = 3) -> pd.DataFrame:
-    """Download price data from *start* to *end* inclusive with caching and retries."""
-    # Validate interval and adjust start date for 15m (yfinance limit: 60 days)
-    if interval == "15m" and (end - start).days > 60:
-        start = end - timedelta(days=60)
-
-    # Check cache
-    cache_file = LOG_DIR / f"prices_{start}_{end}_{interval}.csv"
-    if cache_file.exists():
-        try:
-            prices = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            # Validate cache
-            if prices.empty or all(prices[t].isna().all() for t in TICKERS + [VIX_TICKER] if t in prices.columns):
-                print(f"Invalid cache {cache_file}, refetching")
-            else:
-                print(f"Loaded cached data from {cache_file}")
-                return prices
-        except Exception as e:
-            print(f"Error reading cache {cache_file}: {e}")
-
-    # Fetch data with retries
+def fetch_prices(tickers, interval='15m', retries=3):
+    """
+    Fetch real-time prices for given tickers with retry mechanism.
+    """
     for attempt in range(retries):
         try:
-            data = yf.download(TICKERS + [VIX_TICKER], start=start, end=end + timedelta(days=1), interval=interval,
-                               auto_adjust=True, progress=False, prepost=True, group_by="ticker")
+            logger.info(f"Fetching prices for {tickers} at {datetime.now()}")
+            data = yf.download(tickers, period='1d', interval=interval, progress=False)
             if data.empty:
-                raise ValueError(f"No data returned for {TICKERS + [VIX_TICKER]} from {start} to {end}")
-            # Validate tickers
-            missing_tickers = [t for t in TICKERS + [VIX_TICKER] if t not in data.columns.levels[0]]
-            if missing_tickers:
-                print(f"Warning: Missing data for tickers: {missing_tickers}")
-            # Select price column: prefer Adj Close, fallback to Close
-            price_col = "Adj Close" if "Adj Close" in data.columns.levels[1] else "Close"
-            if price_col == "Close":
-                print(f"Warning: Using 'Close' instead of 'Adj Close' for {interval} data")
-            prices = data.xs(price_col, level=1, axis=1, drop_level=True)
-            # Cache data
-            try:
-                prices.to_csv(cache_file)
-                print(f"Saved data to {cache_file}")
-            except Exception as e:
-                print(f"Error caching data to {cache_file}: {e}")
-            return prices
+                raise ValueError("Empty data returned from yfinance")
+            close_prices = data['Close'].iloc[-1].to_dict()
+            validated_prices = {}
+            for ticker in tickers:
+                price = close_prices.get(ticker)
+                if pd.isna(price) or price <= 0:
+                    raise ValueError(f"Invalid price for {ticker}: {price}")
+                validated_prices[ticker] = price
+            return validated_prices
         except Exception as e:
+            logger.error(f"Error fetching prices (attempt {attempt + 1}/{retries}): {e}")
             if attempt < retries - 1:
-                print(f"Attempt {attempt + 1} failed: {e}, retrying in 10 seconds...")
-                time.sleep(10)
+                time.sleep(5)
             else:
-                print(f"Failed after {retries} attempts: {e}")
-                return pd.DataFrame()
+                logger.error("Max retries reached. Using last known prices or exiting.")
+                return None
+    return None
 
-# TA helpers ----------------------------------------------------
-
-def ta_rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    up    = delta.clip(lower=0)
-    down  = -delta.clip(upper=0)
-    ma_up   = up.rolling(length).mean()
-    ma_down = down.rolling(length).mean()
-    rs = ma_up / ma_down
-    return 100 - (100 / (1 + rs))
-
-# Indicator builder --------------------------------------------
-
-def compute_indicators(df_daily: pd.DataFrame) -> dict:
-    if df_daily.empty:
-        print("Error: Empty DataFrame provided to compute_indicators")
-        return {}
-    ind = {}
-    for t in TICKERS:
-        if t not in df_daily.columns:
-            print(f"Warning: No data for {t}, skipping")
-            continue
-        series = df_daily[t]
-        if series.isna().all():
-            print(f"Warning: All data for {t} is NaN, skipping")
-            continue
-        sma20  = series.rolling(20).mean().iloc[-1]
-        std20  = series.rolling(20).std().iloc[-1]
-        rsi    = ta_rsi(series, 20).iloc[-1]
-        high52 = series.rolling(252).max().iloc[-1]
-        ind[t] = {
-            "latest"    : series.iloc[-1],
-            "sma20"     : sma20,
-            "lower_band": sma20 - std20,
-            "rsi"       : rsi,
-            "drawdown"  : (high52 - series.iloc[-1]) / high52 if not pd.isna(high52) else 0,
+def calculate_indicators(prices_df, ticker):
+    """
+    Calculate technical indicators for a given ticker.
+    """
+    if len(prices_df) < 20:
+        logger.warning(f"Insufficient data for {ticker} indicators: {len(prices_df)} periods")
+        return {
+            'SMA20': np.nan,
+            'Lower_BB': np.nan,
+            'RSI': np.nan,
+            'Drawdown': 0.0
         }
-        # Debug logging
-        print(f"{t} Indicators: Close={ind[t]['latest']:.2f}, SMA20={sma20:.2f}, "
-              f"SMA20_GAP={((ind[t]['latest'] - sma20) / sma20 * 100):.2f}%, "
-              f"Lower_BB={ind[t]['lower_band']:.2f}, RSI={rsi:.2f}, "
-              f"Drawdown={ind[t]['drawdown']*100:.2f}%")
-    if VIX_TICKER in df_daily.columns and not df_daily[VIX_TICKER].isna().all():
-        ind["VIX"] = df_daily[VIX_TICKER].iloc[-1]
-        print(f"VIX: {ind['VIX']:.2f}")
-    else:
-        print(f"Warning: No valid VIX data, setting VIX to 0")
-        ind["VIX"] = 0
-    return ind
 
-# Event evaluation ---------------------------------------------
+    close = prices_df[ticker]
+    sma20 = close.rolling(window=20).mean().iloc[-1]
+    std20 = close.rolling(window=20).std().iloc[-1]
+    lower_bb = sma20 - 2 * std20 if not pd.isna(std20) else np.nan
 
-def evaluate_events(ind: dict) -> List[Tuple[str, str, float]]:
-    out = []
-    if not ind:
-        return out
-    vix_val = ind.get("VIX", 0)
-    for t in TICKERS:
-        if t not in ind:
-            continue
-        i = ind[t]
-        price = i["latest"]
-        if pd.isna(price):
-            continue
-        # Mean-reversion
-        if not pd.isna(i["sma20"]) and price <= i["sma20"] * (1 - GAP_PCT):
-            out.append(("SMA20_GAP", t, price))
-        if not pd.isna(i["lower_band"]) and price <= i["lower_band"]:
-            out.append(("BOLLINGER", t, price))
-        if not pd.isna(i["rsi"]) and i["rsi"] < 30:
-            out.append(("RSI", t, price))
-        # Drawdown
-        if not pd.isna(i["drawdown"]) and i["drawdown"] >= DRAW_PCT:
-            out.append(("DD10", t, price))
-        # Fear gauges
-        if vix_val > VIX_WARN:
-            out.append(("VIX25", t, price))
-        if vix_val > VIX_BRAKE:
-            out.append(("RISK_BRAKE", t, price))
-    # Debug events
-    if out:
-        print(f"Events triggered: {[(ev, tk, price) for ev, tk, price in out]}")
-    else:
-        print("No events triggered")
-    return out
+    # RSI calculation
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean().iloc[-1]
+    loss = -delta.where(delta < 0, 0).rolling(window=14).mean().iloc[-1]
+    rs = gain / loss if loss != 0 else np.inf
+    rsi = 100 - (100 / (1 + rs)) if rs != np.inf else np.nan
 
-# Logging -------------------------------------------------------
+    # Drawdown calculation
+    peak = close.max()
+    current = close.iloc[-1]
+    drawdown = ((peak - current) / peak) * 100 if peak != 0 else 0.0
 
-def log_events(events: List[Tuple[str, str, float]], as_of: date) -> None:
+    return {
+        'SMA20': sma20,
+        'Lower_BB': lower_bb,
+        'RSI': rsi,
+        'Drawdown': drawdown
+    }
+
+def check_events(ticker, price, indicators, vix):
+    """
+    Check for event triggers based on price, indicators, and VIX.
+    """
+    events = []
+    if vix > 25:
+        events.append(('VIX25', ticker, price))
+    if not pd.isna(indicators['SMA20']) and price < indicators['SMA20'] * 0.95:
+        events.append(('SMA20_GAP', ticker, price))
+    if not pd.isna(indicators['Lower_BB']) and price < indicators['Lower_BB']:
+        events.append(('BOLLINGER', ticker, price))
+    if not pd.isna(indicators['RSI']) and indicators['RSI'] < 30:
+        events.append(('RSI', ticker, price))
+    if indicators['Drawdown'] > 10:
+        events.append(('DD10', ticker, price))
+    if len(events) > 1:
+        events.append(('RISK_BRAKE', ticker, price))
+    return events
+
+def save_events(events, timestamp):
+    """
+    Save triggered events to CSV.
+    """
     if not events:
         return
-    fname = LOG_DIR / f"{as_of}_events.csv"
-    new_file = not fname.exists()
-    with fname.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(["timestamp", "event", "ticker", "price"])
-        for ev, ticker, price in events:
-            w.writerow([now().isoformat(), ev, ticker, f"{price:.2f}"])
+    event_data = [
+        {'timestamp': timestamp, 'event': event, 'ticker': ticker, 'price': price}
+        for event, ticker, price in events
+    ]
+    df = pd.DataFrame(event_data)
+    file_exists = os.path.exists(EVENTS_FILE)
+    df.to_csv(EVENTS_FILE, mode='a', header=not file_exists, index=False)
+    logger.info(f"Saved {len(event_data)} events to {EVENTS_FILE}")
 
-def update_summary(events: List[Tuple[str, str, float]], as_of: date) -> None:
-    """Update daily event counts in a summary CSV file, ensuring one row per day."""
-    counts = {ev: 0 for ev in EVENTS}
-    for ev, _, _ in events:
-        if ev in counts:
-            counts[ev] += 1
-    summary_file = LOG_DIR / "event_summary.csv"
-    try:
-        summary = pd.read_csv(summary_file) if summary_file.exists() else pd.DataFrame(columns=["date"] + list(EVENTS.keys()))
-        # Remove existing entry for as_of
-        summary = summary[summary["date"] != as_of.isoformat()]
-        # Append new counts
-        new_row = pd.DataFrame([{"date": as_of.isoformat(), **counts}])
-        summary = pd.concat([summary, new_row], ignore_index=True)
-        summary.to_csv(summary_file, index=False)
-        print(f"Updated summary for {as_of}: {counts}")
-    except Exception as e:
-        print(f"Error updating summary: {e}")
+def update_summary(events):
+    """
+    Update event summary CSV.
+    """
+    summary = {
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'SMA20_GAP': 0,
+        'BOLLINGER': 0,
+        'RSI': 0,
+        'VIX25': 0,
+        'DD10': 0,
+        'RISK_BRAKE': 0
+    }
+    for event, _, _ in events:
+        if event in summary:
+            summary[event] += 1
+    
+    summary_df = pd.DataFrame([summary])
+    file_exists = os.path.exists(SUMMARY_FILE)
+    summary_df.to_csv(SUMMARY_FILE, mode='a', header=not file_exists, index=False)
+    logger.info(f"Updated summary in {SUMMARY_FILE}")
 
-# Email ---------------------------------------------------------
+def save_prices(prices, timestamp):
+    """
+    Save price data to CSV.
+    """
+    price_data = {'Datetime': timestamp}
+    price_data.update(prices)
+    df = pd.DataFrame([price_data])
+    file_exists = os.path.exists(PRICES_FILE)
+    df.to_csv(PRICES_FILE, mode='a', header=not file_exists, index=False)
+    logger.info(f"Saved prices to {PRICES_FILE}")
 
-def send_email(events: List[Tuple[str, str, float]]) -> None:
-    """Send email alerts for triggered events if configured."""
-    if not (SMTP_USER and SMTP_PASS and ALERT_TO):
-        print("Email not configured, skipping")
-        return
-    to_alert = [e for e in events if e[0] in ALERT_TRIGGERS]
-    if not to_alert:
-        return
-    try:
-        body = "\n".join([f"{ev} — {tk} @ {price:.2f}" for ev, tk, price in to_alert])
-        msg = EmailMessage()
-        msg["Subject"] = "Dip-monitor alert"
-        msg["From"] = SMTP_USER
-        msg["To"] = ALERT_TO
-        msg.set_content(body)
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=create_default_context()) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-        print("Email sent successfully")
-    except Exception as e:
-        print(f"Error sending email: {e}")
+def validate_prices(prices, previous_prices):
+    """
+    Validate that prices have changed since the last poll.
+    """
+    if not previous_prices:
+        return True
+    for ticker, price in prices.items():
+        if ticker in previous_prices and abs(price - previous_prices[ticker]) < 1e-5:
+            logger.warning(f"Price for {ticker} unchanged: {price}")
+            return False
+    return True
 
-# Intraday poll -------------------------------------------------
+def main():
+    """
+    Main loop to monitor market dips.
+    """
+    logger.info("Starting Market Dip Monitor v2")
+    previous_prices = {}
+    price_history = {ticker: [] for ticker in TICKERS}
 
-def intraday_poll() -> None:
-    end_dt = now()
-    start_dt = (end_dt - timedelta(days=20)).date()
-    end_date = end_dt.date() if hasattr(end_dt, 'date') else end_dt
-    df = fetch_prices(start_dt, end_date, interval="15m")
-    if df.empty:
-        print("No intraday data available")
-        return
-    df = df.resample("1D").last()
-    if df.index[-1].date() != end_date:
-        print(f"Warning: Latest data is from {df.index[-1].date()}, expected {end_date}")
-    ind = compute_indicators(df)
-    events = evaluate_events(ind)
-    log_events(events, as_of=end_date)
-    update_summary(events, as_of=end_date)
-    send_email(events)
-    for ev, tk, price in events:
-        print(f"{ev} on {tk} at {price:.2f}")
+    while True:
+        now = datetime.now()
+        current_time = now.time()
+        
+        # Check if within trading hours
+        if TRADING_HOURS_START <= current_time <= TRADING_HOURS_END:
+            # Fetch prices
+            prices = fetch_prices(TICKERS)
+            if prices is None:
+                logger.error("Failed to fetch prices. Skipping this poll.")
+                time.sleep(60)  # Wait before retrying
+                continue
 
-# Historical poll -----------------------------------------------
+            # Validate prices
+            if not validate_prices(prices, previous_prices):
+                logger.error("Unchanged prices detected. Forcing refetch.")
+                time.sleep(5)
+                prices = fetch_prices(TICKERS)
+                if prices is None:
+                    logger.error("Refetch failed. Skipping this poll.")
+                    time.sleep(60)
+                    continue
 
-def historical_poll(start_date: date, end_date: date) -> None:
-    """Evaluate events for each day in the range [start_date, end_date]."""
-    current_date = start_date
-    while current_date <= end_date:
-        # Fetch data up to current_date with 20-day lookback for indicators
-        fetch_start = current_date - timedelta(days=20)
-        df = fetch_prices(fetch_start, current_date, interval="15m")
-        if df.empty:
-            print(f"No intraday data available for {current_date}")
-            current_date += timedelta(days=1)
-            continue
-        df = df.resample("1D").last()
-        if df.index[-1].date() != current_date:
-            print(f"Warning: Latest data for {current_date} is from {df.index[-1].date()}")
-        ind = compute_indicators(df)
-        events = evaluate_events(ind)
-        log_events(events, as_of=current_date)
-        update_summary(events, as_of=current_date)
-        for ev, tk, price in events:
-            print(f"{current_date}: {ev} on {tk} at {price:.2f}")
-        current_date += timedelta(days=1)
+            previous_prices = prices.copy()
+            timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
 
-# Daily summary -------------------------------------------------
+            # Save prices
+            save_prices(prices, timestamp)
 
-def daily_summary(target: date) -> None:
-    start = target - timedelta(days=260)
-    df_d = fetch_prices(start, target, interval="1d")
-    if df_d.empty:
-        print(f"No daily data available for {target}")
-        return
-    if df_d.index[-1].date() != target:
-        print(f"Warning: Latest data is from {df_d.index[-1].date()}, expected {target}")
-    ind = compute_indicators(df_d)
-    events = evaluate_events(ind)
-    log_events(events, as_of=target)
+            # Update price history
+            for ticker in TICKERS:
+                price_history[ticker].append(prices[ticker])
+                if len(price_history[ticker]) > 20:  # Keep only last 20 for indicators
+                    price_history[ticker].pop(0)
 
-    # Count events by ticker
-    counts = {ev: {t: 0 for t in TICKERS} for ev in EVENTS}
-    log_file = LOG_DIR / f"{target}_events.csv"
-    if log_file.exists():
-        try:
-            with log_file.open(encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row["event"] in counts and row["ticker"] in TICKERS:
-                        counts[row["event"]][row["ticker"]] += 1
-        except Exception as e:
-            print(f"Error reading log {log_file}: {e}")
+            # Create DataFrame for indicators
+            prices_df = pd.DataFrame(price_history)
 
-    summary_path = LOG_DIR / f"{target}_summary.txt"
-    with summary_path.open("w", encoding="utf-8") as f:
-        f.write(f"Daily summary for {target}\n")
-        f.write(f"VIX close: {ind.get('VIX', 0):.2f}\n\n")
-        for ev, desc in EVENTS.items():
-            f.write(f"{ev:10} — {desc}\n")
-            for t in TICKERS:
-                f.write(f"  {t:6} {counts[ev][t]:>3} triggers\n")
-        f.write("\nEvents logged:\n")
-        for ev, tk, price in events:
-            f.write(f"  {ev} on {tk} at {price:.2f}\n")
-    with summary_path.open("r", encoding="utf-8") as f:
-        print(f.read())
+            # Process each ticker
+            all_events = []
+            for ticker in ['VOO', 'QQQM']:
+                indicators = calculate_indicators(prices_df, ticker)
+                logger.info(f"{ticker} Indicators: Close={prices[ticker]:.2f}, "
+                           f"SMA20={indicators['SMA20']:.2f}, "
+                           f"Lower_BB={indicators['Lower_BB']:.2f}, "
+                           f"RSI={indicators['RSI']:.2f}, "
+                           f"Drawdown={indicators['Drawdown']:.2%}")
 
-# CLI entry -----------------------------------------------------
+                events = check_events(ticker, prices[ticker], indicators, prices['^VIX'])
+                all_events.extend(events)
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: python market_dip_monitor.py [intraday | historical YYYY-MM-DD YYYY-MM-DD | daily_summary [YYYY-MM-DD]]")
-        sys.exit(1)
-    cmd = sys.argv[1]
-    if cmd == "intraday":
-        intraday_poll()
-    elif cmd == "historical":
-        if len(sys.argv) != 4:
-            print("Usage: python market_dip_monitor.py historical YYYY-MM-DD YYYY-MM-DD")
-            sys.exit(1)
-        try:
-            start_date = date.fromisoformat(sys.argv[2])
-            end_date = date.fromisoformat(sys.argv[3])
-        except ValueError:
-            print("Dates must be YYYY-MM-DD")
-            sys.exit(1)
-        historical_poll(start_date, end_date)
-    elif cmd == "daily_summary":
-        if len(sys.argv) == 3:
-            try:
-                target_date = date.fromisoformat(sys.argv[2])
-            except ValueError:
-                print("Date must be YYYY-MM-DD")
-                sys.exit(1)
-        else:
-            target_date = now().date()
-        daily_summary(target_date)
-    else:
-        print("Unknown command.")
-        sys.exit(1)
+            # Log and save events
+            if all_events:
+                logger.info(f"Events triggered: {all_events}")
+                save_events(all_events, timestamp)
+                update_summary(all_events)
+
+        # Wait until next polling interval
+        next_poll = (now + timedelta(seconds=POLL_INTERVAL)).replace(second=0, microsecond=0)
+        sleep_seconds = (next_poll - datetime.now()).total_seconds()
+        if sleep_seconds > 0:
+            logger.info(f"Sleeping for {sleep_seconds:.0f} seconds until {next_poll}")
+            time.sleep(sleep_seconds)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Market Dip Monitor stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
