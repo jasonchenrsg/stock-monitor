@@ -2,10 +2,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime, timedelta
 import time
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
+import atexit
+import fcntl
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -28,18 +31,61 @@ DATA_DIR = 'logs'
 EVENTS_FILE = f'{DATA_DIR}/2025-04-30_events.csv'
 SUMMARY_FILE = f'{DATA_DIR}/event_summary.csv'
 PRICES_FILE = f'{DATA_DIR}/prices_2025-04-30_15m.csv'
+LOCK_FILE = f'{DATA_DIR}/market_dip_monitor.lock'
+MAX_CONSECUTIVE_FAILURES = 10  # Exit after 10 failed polls
+API_CALLS_PER_HOUR = 1000  # Conservative estimate for Yahoo Finance
+ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY', '')  # Set your API key in environment
 
 # Ensure data directory exists
 Path(DATA_DIR).mkdir(exist_ok=True)
 
-def fetch_prices(tickers, interval='15m', retries=3):
+# Track API calls
+api_call_count = 0
+last_api_call_time = datetime.now()
+
+def acquire_lock():
     """
-    Fetch real-time prices for given tickers with retry mechanism.
+    Acquire a file lock to prevent concurrent runs.
     """
+    lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("Acquired lock")
+        return lock_fd
+    except IOError:
+        logger.error("Another instance is running. Exiting.")
+        exit(1)
+
+def release_lock(lock_fd):
+    """
+    Release the file lock.
+    """
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    lock_fd.close()
+    if os.path.exists(LOCK_FILE):
+        os.remove(LOCK_FILE)
+    logger.info("Released lock")
+
+def fetch_yahoo_prices(tickers, interval='15m', retries=3):
+    """
+    Fetch prices from Yahoo Finance with exponential backoff.
+    """
+    global api_call_count, last_api_call_time
     for attempt in range(retries):
+        wait_time = (2 ** attempt) * 60  # Exponential backoff: 60s, 120s, 240s
+        if api_call_count >= API_CALLS_PER_HOUR:
+            elapsed = (datetime.now() - last_api_call_time).total_seconds()
+            if elapsed < 3600:
+                sleep_time = 3600 - elapsed
+                logger.warning(f"Approaching rate limit. Sleeping for {sleep_time:.0f} seconds")
+                time.sleep(sleep_time)
+            api_call_count = 0
+            last_api_call_time = datetime.now()
+
         try:
-            logger.info(f"Fetching prices for {tickers} at {datetime.now()}")
+            logger.info(f"Fetching Yahoo prices for {tickers} at {datetime.now()} (attempt {attempt + 1})")
             data = yf.download(tickers, period='1d', interval=interval, progress=False)
+            api_call_count += 1
             if data.empty:
                 raise ValueError("Empty data returned from yfinance")
             close_prices = data['Close'].iloc[-1].to_dict()
@@ -51,13 +97,69 @@ def fetch_prices(tickers, interval='15m', retries=3):
                 validated_prices[ticker] = price
             return validated_prices
         except Exception as e:
-            logger.error(f"Error fetching prices (attempt {attempt + 1}/{retries}): {e}")
+            logger.error(f"Error fetching Yahoo prices (attempt {attempt + 1}/{retries}): {e}")
             if attempt < retries - 1:
-                time.sleep(5)
-            else:
-                logger.error("Max retries reached. Using last known prices or exiting.")
-                return None
+                logger.info(f"Waiting {wait_time}s before retrying")
+                time.sleep(wait_time)
     return None
+
+def fetch_alpha_vantage_prices(tickers):
+    """
+    Fetch prices from Alpha Vantage as a fallback.
+    """
+    if not ALPHA_VANTAGE_API_KEY:
+        logger.warning("No Alpha Vantage API key. Skipping fallback.")
+        return None
+
+    prices = {}
+    for ticker in tickers:
+        try:
+            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={ticker}&interval=15min&apikey={ALPHA_VANTAGE_API_KEY}"
+            response = requests.get(url)
+            data = response.json()
+            if 'Time Series (15min)' not in data:
+                logger.error(f"Invalid Alpha Vantage response for {ticker}: {data.get('Note', 'No data')}")
+                continue
+            latest_time = max(data['Time Series (15min)'].keys())
+            price = float(data['Time Series (15min)'][latest_time]['4. close'])
+            if price <= 0:
+                raise ValueError(f"Invalid price for {ticker}: {price}")
+            prices[ticker] = price
+            time.sleep(1)  # Alpha Vantage free tier: 5 calls/min
+        except Exception as e:
+            logger.error(f"Error fetching Alpha Vantage price for {ticker}: {e}")
+    return prices if len(prices) == len(tickers) else None
+
+def fetch_prices(tickers, interval='15m'):
+    """
+    Fetch prices with Yahoo Finance as primary and Alpha Vantage as fallback.
+    """
+    prices = fetch_yahoo_prices(tickers, interval)
+    if prices is None:
+        logger.info("Yahoo Finance failed. Trying Alpha Vantage.")
+        prices = fetch_alpha_vantage_prices(tickers)
+    return prices
+
+def load_cached_prices():
+    """
+    Load the most recent prices from the price CSV as a fallback.
+    """
+    if not os.path.exists(PRICES_FILE):
+        logger.warning("No cached prices available")
+        return None
+    try:
+        df = pd.read_csv(PRICES_FILE)
+        if df.empty:
+            return None
+        latest = df.iloc[-1]
+        prices = {ticker: latest[ticker] for ticker in TICKERS if ticker in latest and not pd.isna(latest[ticker])}
+        if len(prices) == len(TICKERS):
+            logger.info("Using cached prices")
+            return prices
+        return None
+    except Exception as e:
+        logger.error(f"Error loading cached prices: {e}")
+        return None
 
 def calculate_indicators(prices_df, ticker):
     """
@@ -77,14 +179,12 @@ def calculate_indicators(prices_df, ticker):
     std20 = close.rolling(window=20).std().iloc[-1]
     lower_bb = sma20 - 2 * std20 if not pd.isna(std20) else np.nan
 
-    # RSI calculation
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean().iloc[-1]
     loss = -delta.where(delta < 0, 0).rolling(window=14).mean().iloc[-1]
     rs = gain / loss if loss != 0 else np.inf
     rsi = 100 - (100 / (1 + rs)) if rs != np.inf else np.nan
 
-    # Drawdown calculation
     peak = close.max()
     current = close.iloc[-1]
     drawdown = ((peak - current) / peak) * 100 if peak != 0 else 0.0
@@ -179,9 +279,13 @@ def main():
     """
     Main loop to monitor market dips.
     """
+    lock_fd = acquire_lock()
+    atexit.register(release_lock, lock_fd)
+    
     logger.info("Starting Market Dip Monitor v2")
     previous_prices = {}
     price_history = {ticker: [] for ticker in TICKERS}
+    consecutive_failures = 0
 
     while True:
         now = datetime.now()
@@ -192,20 +296,23 @@ def main():
             # Fetch prices
             prices = fetch_prices(TICKERS)
             if prices is None:
-                logger.error("Failed to fetch prices. Skipping this poll.")
-                time.sleep(60)  # Wait before retrying
-                continue
+                logger.warning("Fetch failed. Attempting to use cached prices.")
+                prices = load_cached_prices()
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.error(f"Reached {MAX_CONSECUTIVE_FAILURES} consecutive failures. Exiting.")
+                    break
+                if prices is None:
+                    logger.error("No cached prices available. Skipping this poll.")
+                    time.sleep(60)
+                    continue
+            else:
+                consecutive_failures = 0
 
             # Validate prices
             if not validate_prices(prices, previous_prices):
-                logger.error("Unchanged prices detected. Forcing refetch.")
-                time.sleep(5)
-                prices = fetch_prices(TICKERS)
-                if prices is None:
-                    logger.error("Refetch failed. Skipping this poll.")
-                    time.sleep(60)
-                    continue
-
+                logger.warning("Unchanged prices detected. Using prices but logging issue.")
+            
             previous_prices = prices.copy()
             timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -215,7 +322,7 @@ def main():
             # Update price history
             for ticker in TICKERS:
                 price_history[ticker].append(prices[ticker])
-                if len(price_history[ticker]) > 20:  # Keep only last 20 for indicators
+                if len(price_history[ticker]) > 20:
                     price_history[ticker].pop(0)
 
             # Create DataFrame for indicators
